@@ -1,95 +1,89 @@
-package main
+//go:build linux
+
+package ndpresponder
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
-	"os/exec"
 	"time"
 
 	"github.com/vishvananda/netlink"
-	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 )
 
-// HostInfo contains address information of the host machine.
-type HostInfo struct {
-	HostMAC   net.HardwareAddr
-	GatewayIP netip.Addr
+// defaultGateway returns the IPv6 default gateway on the interface, or an invalid
+// Addr if there is none.
+func defaultGateway(nl *netlink.Handle, link netlink.Link) (netip.Addr, error) {
+	routes, err := nl.RouteList(link, unix.AF_INET6)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("listing routes: %w", err)
+	}
+	for _, route := range routes {
+		if route.Dst != nil {
+			if ones, _ := route.Dst.Mask.Size(); ones != 0 {
+				continue
+			}
+		}
+		if gw, ok := netip.AddrFromSlice(route.Gw); ok {
+			return gw, nil
+		}
+	}
+	return netip.Addr{}, nil
 }
 
-func gatherHostInfo() (hi HostInfo, e error) {
-	logEntry := logger.Named("HostInfo")
-	hi.HostMAC = netif.HardwareAddr
-	logEntry.Info("found MAC", zap.Stringer("mac", hi.HostMAC))
-
-	nl, e := netlink.NewHandle()
-	if e != nil {
-		logEntry.Error("netlink.NewHandle error", zap.Error(e))
-		return hi, nil
-	}
-	defer nl.Close()
-
-	link, e := nl.LinkByIndex(netif.Index)
-	if e != nil {
-		logEntry.Error("netlink.LinkByIndex error", zap.Error(e))
-		return hi, nil
-	}
-
-	routes, e := nl.RouteList(link, unix.AF_INET6)
-	if e != nil {
-		logEntry.Error("netlink.RouteList error", zap.Error(e))
-		return hi, nil
-	}
-
-	for _, route := range routes {
-		maskLen := 0
-		if route.Dst != nil {
-			maskLen, _ = route.Dst.Mask.Size()
-		}
-		if maskLen == 0 {
-			hi.GatewayIP, _ = netip.AddrFromSlice(route.Gw)
-		}
-	}
-	if !hi.GatewayIP.IsValid() {
-		logEntry.Warn("no default gateway")
-		return hi, nil
-	}
-	logEntry.Info("found gateway", zap.Stringer("gateway", hi.GatewayIP))
-
-	var gatewayNeigh *netlink.Neigh
+// pinGateway waits for the gateway's neighbor entry to resolve, then marks it NOARP so the
+// kernel stops probing it. Answers to our solicitations come back from the gateway to
+// addresses the kernel does not own, which would otherwise keep the entry flapping.
+// A permanent entry is left alone.
+func pinGateway(ctx context.Context, nl *netlink.Handle, iface *net.Interface, gw netip.Addr, logger *slog.Logger) error {
 	for {
-		neighs, e := nl.NeighList(netif.Index, unix.AF_INET6)
-		if e != nil {
-			logEntry.Error("netlink.NeighList error", zap.Error(e))
-			return hi, nil
+		neighs, err := nl.NeighList(iface.Index, unix.AF_INET6)
+		if err != nil {
+			return fmt.Errorf("listing neighbors: %w", err)
 		}
 		for _, neigh := range neighs {
 			ip, _ := netip.AddrFromSlice(neigh.IP)
-			if ip != hi.GatewayIP || len(neigh.HardwareAddr) != 6 {
+			if ip != gw || len(neigh.HardwareAddr) != 6 {
 				continue
 			}
 			switch neigh.State {
-			case unix.NUD_REACHABLE, unix.NUD_NOARP:
-				gatewayNeigh = &neigh
-				goto NEIGH_SET
-			case unix.NUD_PERMANENT:
-				goto NEIGH_SKIP
+			case unix.NUD_PERMANENT, unix.NUD_NOARP:
+				return nil
+			case unix.NUD_REACHABLE:
+				neigh.State = unix.NUD_NOARP
+				if err := nl.NeighSet(&neigh); err != nil {
+					return fmt.Errorf("pinning gateway neighbor: %w", err)
+				}
+				logger.Info("pinned gateway neighbor",
+					slog.String("gateway", gw.String()),
+					slog.String("lladdr", neigh.HardwareAddr.String()))
+				return nil
 			}
 		}
 
-		exec.Command("/usr/bin/ping", "-c", "1", hi.GatewayIP.String()).Run()
-		logEntry.Debug("waiting for gateway neigh entry")
-		time.Sleep(time.Second)
+		pokeNeighbor(iface, gw)
+		logger.Debug("waiting for gateway neighbor entry", slog.String("gateway", gw.String()))
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("gateway %s did not become reachable: %w", gw, ctx.Err())
+		case <-time.After(time.Second):
+		}
 	}
+}
 
-NEIGH_SET:
-	gatewayNeigh.State = unix.NUD_NOARP
-	if e = nl.NeighSet(gatewayNeigh); e != nil {
-		logEntry.Error("netlink.NeighSet error", zap.Error(e))
-	} else {
-		logEntry.Info("netlink.NeighSet OK", zap.Stringer("lladdr", gatewayNeigh.HardwareAddr))
+// pokeNeighbor sends a throwaway datagram to ip so the kernel resolves its link-layer address.
+func pokeNeighbor(iface *net.Interface, ip netip.Addr) {
+	zone := ""
+	if ip.IsLinkLocalUnicast() {
+		zone = iface.Name
 	}
-NEIGH_SKIP:
-
-	return hi, nil
+	conn, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: ip.AsSlice(), Port: 9, Zone: zone})
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	conn.Write([]byte{0})
 }

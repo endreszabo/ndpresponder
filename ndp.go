@@ -1,11 +1,7 @@
-package main
+package ndpresponder
 
 import (
-	"crypto/rand"
-	"errors"
 	"fmt"
-	"io"
-	"math"
 	"net"
 	"net/netip"
 
@@ -14,190 +10,176 @@ import (
 	"golang.org/x/net/bpf"
 )
 
-// tcpdump -dd 'icmp6 && ip6[40]==135'
+// bpfFilter is the output of tcpdump -dd 'icmp6 && ip6[40]==135'.
 var bpfFilter = []bpf.RawInstruction{
-	{0x28, 0, 0, 0x0000000c},
-	{0x15, 0, 8, 0x000086dd},
-	{0x30, 0, 0, 0x00000014},
-	{0x15, 3, 0, 0x0000003a},
-	{0x15, 0, 5, 0x0000002c},
-	{0x30, 0, 0, 0x00000036},
-	{0x15, 0, 3, 0x0000003a},
-	{0x30, 0, 0, 0x00000036},
-	{0x15, 0, 1, 0x00000087},
-	{0x6, 0, 0, 0x00040000},
-	{0x6, 0, 0, 0x00000000},
+	{Op: 0x28, Jt: 0, Jf: 0, K: 0x0000000c},
+	{Op: 0x15, Jt: 0, Jf: 8, K: 0x000086dd},
+	{Op: 0x30, Jt: 0, Jf: 0, K: 0x00000014},
+	{Op: 0x15, Jt: 3, Jf: 0, K: 0x0000003a},
+	{Op: 0x15, Jt: 0, Jf: 5, K: 0x0000002c},
+	{Op: 0x30, Jt: 0, Jf: 0, K: 0x00000036},
+	{Op: 0x15, Jt: 0, Jf: 3, K: 0x0000003a},
+	{Op: 0x30, Jt: 0, Jf: 0, K: 0x00000036},
+	{Op: 0x15, Jt: 0, Jf: 1, K: 0x00000087},
+	{Op: 0x6, Jt: 0, Jf: 0, K: 0x00040000},
+	{Op: 0x6, Jt: 0, Jf: 0, K: 0x00000000},
 }
+
 var packetSerializeOpts = gopacket.SerializeOptions{
 	FixLengths:       true,
 	ComputeChecksums: true,
 }
-var solicitTypeCode = layers.CreateICMPv6TypeCode(layers.ICMPv6TypeNeighborSolicitation, 0)
-var advertTypeCode = layers.CreateICMPv6TypeCode(layers.ICMPv6TypeNeighborAdvertisement, 0)
 
-// Gratuitous creates a gratuitous ICMPv6 neighbor solicitation packet.
-func Gratuitous(w gopacket.SerializeBuffer, hi HostInfo, targetIP netip.Addr) error {
-	ip16 := targetIP.As16()
-	eth := layers.Ethernet{
-		SrcMAC:       hi.HostMAC,
-		DstMAC:       net.HardwareAddr{0x33, 0x33, 0xFF, ip16[13], ip16[14], ip16[15]},
-		EthernetType: layers.EthernetTypeIPv6,
-	}
+var (
+	solicitTypeCode = layers.CreateICMPv6TypeCode(layers.ICMPv6TypeNeighborSolicitation, 0)
+	advertTypeCode  = layers.CreateICMPv6TypeCode(layers.ICMPv6TypeNeighborAdvertisement, 0)
 
-	dstIP := net.IP{0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x01, 0xFF, ip16[13], ip16[14], ip16[15]}
-	ip6 := layers.IPv6{
-		Version:    6,
-		SrcIP:      make(net.IP, net.IPv6len),
-		DstIP:      dstIP,
-		NextHeader: layers.IPProtocolICMPv6,
-		HopLimit:   math.MaxUint8,
-	}
+	allNodesIP  = netip.MustParseAddr("ff02::1")
+	allNodesMAC = net.HardwareAddr{0x33, 0x33, 0x00, 0x00, 0x00, 0x01}
+)
 
-	icmp6 := layers.ICMPv6{
-		TypeCode: solicitTypeCode,
-	}
-	icmp6.SetNetworkLayerForChecksum(&ip6)
+// NA flag bits (RFC 4861 section 4.4). The router flag is never set: we answer as a host.
+const (
+	naFlagSolicited = 0x40
+	naFlagOverride  = 0x20
+)
 
-	nonce := make([]byte, 6)
-	rand.Read(nonce)
-	solicit := layers.ICMPv6NeighborSolicitation{
-		TargetAddress: targetIP.AsSlice(),
-		Options: layers.ICMPv6Options{
-			{
-				Type: 0x0E,
-				Data: nonce,
-			},
-		},
-	}
+// ndpHopLimit is the only hop limit a valid NDP packet may carry (RFC 4861 section 7.1.1).
+const ndpHopLimit = 255
 
-	return gopacket.SerializeLayers(w, packetSerializeOpts, &eth, &ip6, &icmp6, &solicit)
-
+// solicitedNode returns the solicited-node multicast address of ip (RFC 4291 section 2.7.1).
+func solicitedNode(ip netip.Addr) netip.Addr {
+	a := ip.As16()
+	return netip.AddrFrom16([16]byte{0: 0xff, 1: 0x02, 11: 0x01, 12: 0xff, 13: a[13], 14: a[14], 15: a[15]})
 }
 
-// Solicit creates an ICMPv6 neighbor solicitation packet.
-func Solicit(w gopacket.SerializeBuffer, hi HostInfo, sourceIP netip.Addr) error {
-	eth := layers.Ethernet{
-		SrcMAC:       hi.HostMAC,
-		DstMAC:       net.HardwareAddr{0x33, 0x33, 0xFF, 0x00, 0x00, 0x01},
-		EthernetType: layers.EthernetTypeIPv6,
-	}
-
-	dstIP := net.IP{0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x01, 0xFF, 0x00, 0x00, 0x01}
-	ip6 := layers.IPv6{
-		Version:    6,
-		SrcIP:      sourceIP.AsSlice(),
-		DstIP:      dstIP,
-		NextHeader: layers.IPProtocolICMPv6,
-		HopLimit:   math.MaxUint8,
-	}
-
-	icmp6 := layers.ICMPv6{
-		TypeCode: solicitTypeCode,
-	}
-	icmp6.SetNetworkLayerForChecksum(&ip6)
-
-	nonce := make([]byte, 6)
-	rand.Read(nonce)
-	solicit := layers.ICMPv6NeighborSolicitation{
-		TargetAddress: hi.GatewayIP.AsSlice(),
-		Options: layers.ICMPv6Options{
-			{
-				Type: layers.ICMPv6OptSourceAddress,
-				Data: hi.HostMAC,
-			},
-		},
-	}
-
-	return gopacket.SerializeLayers(w, packetSerializeOpts, &eth, &ip6, &icmp6, &solicit)
+// multicastMAC returns the Ethernet address that IPv6 multicast group ip maps to (RFC 2464 section 7).
+func multicastMAC(ip netip.Addr) net.HardwareAddr {
+	a := ip.As16()
+	return net.HardwareAddr{0x33, 0x33, a[12], a[13], a[14], a[15]}
 }
 
 // NeighSolicitation contains information from an ICMPv6 neighbor solicitation packet.
 type NeighSolicitation struct {
-	RouterMAC [6]byte
-	RouterIP  netip.Addr
-	DestIP    netip.Addr
-	TargetIP  netip.Addr
+	SrcMAC   net.HardwareAddr
+	SrcIP    netip.Addr // unspecified for duplicate address detection probes
+	DstIP    netip.Addr
+	TargetIP netip.Addr
 }
 
 func (ns NeighSolicitation) String() string {
-	if ns.DestIP.IsMulticast() {
-		return fmt.Sprintf("who-has %s tell %s", ns.TargetIP, ns.RouterIP)
+	switch {
+	case ns.SrcIP.IsUnspecified():
+		return fmt.Sprintf("dad %s", ns.TargetIP)
+	case ns.DstIP.IsMulticast():
+		return fmt.Sprintf("who-has %s tell %s", ns.TargetIP, ns.SrcIP)
 	}
-	return fmt.Sprintf("is-alive %s tell %s", ns.TargetIP, ns.RouterIP)
+	return fmt.Sprintf("is-alive %s tell %s", ns.TargetIP, ns.SrcIP)
 }
 
-// Respond creates an ICMPv6 neighbor advertisement packet.
-func (ns NeighSolicitation) Respond(w gopacket.SerializeBuffer, hi HostInfo) error {
+// solicitationParser decodes neighbor solicitations from raw Ethernet frames.
+type solicitationParser struct {
+	eth     layers.Ethernet
+	ip6     layers.IPv6
+	icmp6   layers.ICMPv6
+	solicit layers.ICMPv6NeighborSolicitation
+	parser  *gopacket.DecodingLayerParser
+	decoded []gopacket.LayerType
+}
+
+func newSolicitationParser() *solicitationParser {
+	p := &solicitationParser{}
+	p.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &p.eth, &p.ip6, &p.icmp6, &p.solicit)
+	return p
+}
+
+// parse returns the solicitation in frame, or false if frame is not a valid neighbor solicitation.
+func (p *solicitationParser) parse(frame []byte) (NeighSolicitation, bool) {
+	if err := p.parser.DecodeLayers(frame, &p.decoded); err != nil {
+		return NeighSolicitation{}, false
+	}
+	if len(p.decoded) != 4 || p.decoded[3] != layers.LayerTypeICMPv6NeighborSolicitation {
+		return NeighSolicitation{}, false
+	}
+	if p.ip6.HopLimit != ndpHopLimit || p.icmp6.TypeCode != solicitTypeCode {
+		return NeighSolicitation{}, false
+	}
+	var ns NeighSolicitation
+	var ok1, ok2, ok3 bool
+	ns.SrcMAC = append(net.HardwareAddr(nil), p.eth.SrcMAC...)
+	ns.SrcIP, ok1 = netip.AddrFromSlice(p.ip6.SrcIP)
+	ns.DstIP, ok2 = netip.AddrFromSlice(p.ip6.DstIP)
+	ns.TargetIP, ok3 = netip.AddrFromSlice(p.solicit.TargetAddress)
+	if !ok1 || !ok2 || !ok3 || ns.TargetIP.IsMulticast() {
+		return NeighSolicitation{}, false
+	}
+	return ns, true
+}
+
+// writeAdvert serializes a neighbor advertisement for ns into w, sent from hostMAC.
+// Duplicate address detection probes are answered to all-nodes, as RFC 4861 section 7.2.4 requires.
+func writeAdvert(w gopacket.SerializeBuffer, ns NeighSolicitation, hostMAC net.HardwareAddr) error {
+	if ns.SrcIP.IsUnspecified() {
+		return writeNA(w, hostMAC, allNodesMAC, allNodesIP, ns.TargetIP, naFlagOverride)
+	}
+	return writeNA(w, hostMAC, ns.SrcMAC, ns.SrcIP, ns.TargetIP, naFlagSolicited|naFlagOverride)
+}
+
+// writeUnsolicitedAdvert serializes an unsolicited neighbor advertisement for target to all-nodes.
+func writeUnsolicitedAdvert(w gopacket.SerializeBuffer, hostMAC net.HardwareAddr, target netip.Addr) error {
+	return writeNA(w, hostMAC, allNodesMAC, allNodesIP, target, naFlagOverride)
+}
+
+func writeNA(w gopacket.SerializeBuffer, srcMAC, dstMAC net.HardwareAddr, dstIP, target netip.Addr, flags uint8) error {
 	eth := layers.Ethernet{
-		SrcMAC:       hi.HostMAC,
-		DstMAC:       ns.RouterMAC[:],
+		SrcMAC:       srcMAC,
+		DstMAC:       dstMAC,
 		EthernetType: layers.EthernetTypeIPv6,
 	}
-
 	ip6 := layers.IPv6{
 		Version:    6,
-		SrcIP:      ns.TargetIP.AsSlice(),
-		DstIP:      ns.RouterIP.AsSlice(),
+		SrcIP:      target.AsSlice(),
+		DstIP:      dstIP.AsSlice(),
 		NextHeader: layers.IPProtocolICMPv6,
-		HopLimit:   math.MaxUint8,
+		HopLimit:   ndpHopLimit,
 	}
-
-	icmp6 := layers.ICMPv6{
-		TypeCode: advertTypeCode,
-	}
+	icmp6 := layers.ICMPv6{TypeCode: advertTypeCode}
 	icmp6.SetNetworkLayerForChecksum(&ip6)
-
-	var advertFlags uint8 = 0x80 | 0x40 // router, solicited
-	if ns.DestIP.IsMulticast() {
-		advertFlags |= 0x20 // override
-	}
 	advert := layers.ICMPv6NeighborAdvertisement{
-		Flags:         advertFlags,
-		TargetAddress: ns.TargetIP.AsSlice(),
+		Flags:         flags,
+		TargetAddress: target.AsSlice(),
 		Options: layers.ICMPv6Options{
-			{
-				Type: layers.ICMPv6OptTargetAddress,
-				Data: hi.HostMAC,
-			},
+			{Type: layers.ICMPv6OptTargetAddress, Data: srcMAC},
 		},
 	}
-
 	return gopacket.SerializeLayers(w, packetSerializeOpts, &eth, &ip6, &icmp6, &advert)
 }
 
-// CaptureNeighSolicitation captures ICMPv6 neighbor solicitation packets.
-func CaptureNeighSolicitation(src gopacket.ZeroCopyPacketDataSource) <-chan NeighSolicitation {
-	ch := make(chan NeighSolicitation)
-	go func() {
-		var eth layers.Ethernet
-		var ip6 layers.IPv6
-		var icmp6 layers.ICMPv6
-		var solicit layers.ICMPv6NeighborSolicitation
-		parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &icmp6, &solicit)
-		decoded := []gopacket.LayerType{}
-
-		for {
-			pkt, _, e := src.ZeroCopyReadPacketData()
-			if errors.Is(e, io.EOF) {
-				close(ch)
-				return
-			}
-
-			if e := parser.DecodeLayers(pkt, &decoded); e != nil {
-				continue
-			}
-
-			if len(decoded) == 4 && decoded[3] == layers.LayerTypeICMPv6NeighborSolicitation {
-				ns := NeighSolicitation{}
-				copy(ns.RouterMAC[:], eth.SrcMAC)
-				ns.RouterIP, _ = netip.AddrFromSlice(ip6.SrcIP)
-				ns.DestIP, _ = netip.AddrFromSlice(ip6.DstIP)
-				ns.TargetIP, _ = netip.AddrFromSlice(solicit.TargetAddress)
-				ch <- ns
-			}
-		}
-	}()
-	return ch
+// writeSolicit serializes a neighbor solicitation for target, sent from srcIP to target's
+// solicited-node group. It carries our link-layer address, so the target creates a neighbor
+// entry for srcIP (RFC 4861 section 7.2.3); routers ignore unsolicited advertisements for
+// addresses they have no entry for.
+func writeSolicit(w gopacket.SerializeBuffer, hostMAC net.HardwareAddr, srcIP, target netip.Addr) error {
+	group := solicitedNode(target)
+	eth := layers.Ethernet{
+		SrcMAC:       hostMAC,
+		DstMAC:       multicastMAC(group),
+		EthernetType: layers.EthernetTypeIPv6,
+	}
+	ip6 := layers.IPv6{
+		Version:    6,
+		SrcIP:      srcIP.AsSlice(),
+		DstIP:      group.AsSlice(),
+		NextHeader: layers.IPProtocolICMPv6,
+		HopLimit:   ndpHopLimit,
+	}
+	icmp6 := layers.ICMPv6{TypeCode: solicitTypeCode}
+	icmp6.SetNetworkLayerForChecksum(&ip6)
+	solicit := layers.ICMPv6NeighborSolicitation{
+		TargetAddress: target.AsSlice(),
+		Options: layers.ICMPv6Options{
+			{Type: layers.ICMPv6OptSourceAddress, Data: hostMAC},
+		},
+	}
+	return gopacket.SerializeLayers(w, packetSerializeOpts, &eth, &ip6, &icmp6, &solicit)
 }
